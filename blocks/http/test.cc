@@ -42,11 +42,12 @@ SOFTWARE.
 #include "../../typesystem/struct.h"
 
 #include "../../bricks/dflags/dflags.h"
+#include "../../bricks/exception.h"
+#include "../../bricks/file/file.h"
 #include "../../bricks/strings/join.h"
 #include "../../bricks/strings/printf.h"
+#include "../../bricks/sync/waitable_atomic.h"
 #include "../../bricks/util/singleton.h"
-#include "../../bricks/file/file.h"
-#include "../../bricks/exception.h"
 
 #include "../../3rdparty/gtest/gtest-main-with-dflags.h"
 
@@ -802,13 +803,15 @@ TEST(HTTPAPI, GetByChunksPrototype) {
     class ChunkByChunkHTTPResponseReceiver {
      public:
       struct ConstructionParams {
-        std::function<void(const std::string&, const std::string&)> header_callback;
+        std::function<void(const std::string&, const std::string&, current::net::HTTPResponseKind&)> header_callback;
         std::function<void(const std::string&)> chunk_callback;
         std::function<void()> done_callback;
 
         ConstructionParams() = delete;
 
-        ConstructionParams(std::function<void(const std::string&, const std::string&)> header_callback,
+        ConstructionParams(std::function<void(const std::string&,
+                                              const std::string&,
+                                              current::net::HTTPResponseKind&)> header_callback,
                            std::function<void(const std::string&)> chunk_callback,
                            std::function<void()> done_callback)
             : header_callback(header_callback), chunk_callback(chunk_callback), done_callback(done_callback) {}
@@ -825,7 +828,9 @@ TEST(HTTPAPI, GetByChunksPrototype) {
       const current::net::http::Headers& headers() const { return headers_; }
 
      protected:
-      inline void OnHeader(const char* key, const char* value) { params.header_callback(key, value); }
+      inline void OnHeader(const char* key, const char* value, current::net::HTTPResponseKind& response_kind) {
+        params.header_callback(key, value, response_kind);
+      }
 
       inline void OnChunk(const char* chunk, size_t length) { params.chunk_callback(std::string(chunk, length)); }
 
@@ -842,7 +847,9 @@ TEST(HTTPAPI, GetByChunksPrototype) {
     std::vector<std::string> headers;
     std::vector<std::string> chunk_by_chunk_response;
     const auto header_callback =
-        [&headers](const std::string& k, const std::string& v) { headers.push_back(k + '=' + v); };
+        [&headers](const std::string& k, const std::string& v, current::net::HTTPResponseKind&) {
+          headers.push_back(k + '=' + v);
+        };
     const auto chunk_callback =
         [&chunk_by_chunk_response](const std::string& s) { chunk_by_chunk_response.push_back(s); };
     const auto done_callback = [&chunk_by_chunk_response]() { chunk_by_chunk_response.push_back("DONE"); };
@@ -881,6 +888,9 @@ TEST(HTTPAPI, ChunkedBodySemantics) {
                                                          Headers({{"TestHeaderName", "TestHeaderValue"}}),
                                                          current::net::constants::kDefaultJSONStreamContentType);
     std::string const bar = r.method == "POST" ? r.body : "bar";
+    if (r.headers.Has("testheader")) {
+      response.Send("HEADER: " + r.headers.Get("testheader") + '\n');
+    }
     response.Send("{\"s\":");  // Lines intentionally broken into chunks the wrong way.
     response.Send("\"foo\"");
     response.Send("}\n{\"s\":\"" + bar + "\"}\n");
@@ -894,6 +904,25 @@ TEST(HTTPAPI, ChunkedBodySemantics) {
     EXPECT_EQ(200, static_cast<int>(response.code));
     using S = HTTPAPITestStructWithS;
     EXPECT_EQ(JSON(S("foo")) + '\n' + JSON(S("bar")) + '\n' + JSON(S("baz")), response.body);
+    EXPECT_EQ(4u, response.headers.size());
+    EXPECT_EQ(
+        "{"
+        "\"Connection\":\"keep-alive\","
+        "\"Content-Type\":\"application/stream+json; charset=utf-8\","
+        "\"TestHeaderName\":\"TestHeaderValue\","
+        "\"Transfer-Encoding\":\"chunked\""
+        "}",
+        JSON(response.headers.AsMap()));
+  }
+
+  {
+    const auto response = HTTP(GET(url).SetHeader("testheader", "Test Header Value"));
+    EXPECT_EQ(200, static_cast<int>(response.code));
+    using S = HTTPAPITestStructWithS;
+    EXPECT_EQ(
+        "HEADER: Test Header Value\n" +
+        JSON(S("foo")) + '\n' + JSON(S("bar")) + '\n' + JSON(S("baz")),
+        response.body);
     EXPECT_EQ(4u, response.headers.size());
     EXPECT_EQ(
         "{"
@@ -995,6 +1024,43 @@ TEST(HTTPAPI, ChunkedBodySemantics) {
 
   {
     std::vector<std::string> headers;
+    std::vector<std::string> line_by_line_response;
+
+    const auto response = HTTP(ChunkedPOST(url, "passed")
+        .SetHeader("testheader", "Test Header Value")
+        .OnHeader([&headers](const std::string& k, const std::string& v) { headers.push_back(k + '=' + v); })
+        .OnLine([&line_by_line_response](const std::string& s) { line_by_line_response.push_back(s); }));
+    EXPECT_EQ(200, static_cast<int>(response));
+    EXPECT_EQ(
+        "HEADER: Test Header Value|{\"s\":\"foo\"}|{\"s\":\"passed\"}|{\"s\":\"baz\"}",
+        current::strings::Join(line_by_line_response, '|'));
+    EXPECT_EQ(4u, headers.size());
+    EXPECT_EQ("Content-Type=application/stream+json; charset=utf-8|Connection=keep-alive"
+              "|TestHeaderName=TestHeaderValue|Transfer-Encoding=chunked",
+              current::strings::Join(headers, '|'));
+  }
+
+  {
+    // This test is to test the fix for the bug where `.OnDone()` clears previously set `.OnLine()` handlers.
+    std::vector<std::string> headers;
+    std::vector<std::string> line_by_line_response;
+
+    const auto response = HTTP(ChunkedPOST(url, "passed")
+        .OnHeader([&headers](const std::string& k, const std::string& v) { headers.push_back(k + '=' + v); })
+        .OnLine([&line_by_line_response](const std::string& s) { line_by_line_response.push_back(s); })
+        .OnDone([]() {}));
+    EXPECT_EQ(200, static_cast<int>(response));
+    EXPECT_EQ(
+        "{\"s\":\"foo\"}|{\"s\":\"passed\"}|{\"s\":\"baz\"}",
+        current::strings::Join(line_by_line_response, '|'));
+    EXPECT_EQ(4u, headers.size());
+    EXPECT_EQ("Content-Type=application/stream+json; charset=utf-8|Connection=keep-alive"
+              "|TestHeaderName=TestHeaderValue|Transfer-Encoding=chunked",
+              current::strings::Join(headers, '|'));
+  }
+
+  {
+    std::vector<std::string> headers;
     std::vector<std::string> parsed_body_pieces;
     using S = HTTPAPITestStructWithS;
 
@@ -1004,6 +1070,117 @@ TEST(HTTPAPI, ChunkedBodySemantics) {
     EXPECT_EQ(200, static_cast<int>(response));
     EXPECT_EQ("foo,meh,baz", current::strings::Join(parsed_body_pieces, ','));
   }
+}
+
+TEST(HTTPAPI, CanUnderstandMalformedDockerResponse) {
+  const auto scope_correct = HTTP(FLAGS_net_api_test_port)
+                         .Register("/correct",
+                                   [](Request r) {
+                                     EXPECT_EQ("GET", r.method);
+                                     EXPECT_EQ("", r.body);
+                                     r.connection.DoNotSendAnyResponse();  // For no "no response sent" exception.
+                                     auto& c = r.connection.RawConnection();
+                                     c.BlockingWrite("HTTP/1.1 200 OK\r\n", true);
+                                     c.BlockingWrite("Host: localhost\r\n", true);
+                                     c.BlockingWrite("Content-Length: 3\r\n", true);
+                                     c.BlockingWrite("\r\n", true);
+                                     c.BlockingWrite("foo", true);
+                                     c.BlockingWrite("\r\n", false);
+                                   });
+  current::WaitableAtomic<bool> wait_after_foo_signal(false);
+  const auto scope_malformed = HTTP(FLAGS_net_api_test_port)
+                         .Register("/potentially_malformed",
+                                   [&wait_after_foo_signal](Request r) {
+                                     EXPECT_EQ("GET", r.method);
+                                     EXPECT_EQ("", r.body);
+                                     r.connection.DoNotSendAnyResponse();  // For no "no response sent" exception.
+                                     auto& c = r.connection.RawConnection();
+
+                                     // Without `Transfer-Encoding: chunked` header this is a malformed response.
+                                     // Current then assumes no data would be available.
+                                     // At the same time, Docker Daemon is guilty :-/
+                                     std::vector<std::string> header = {
+                                       "HTTP/1.1 200 OK",
+                                       "Content-Type: application/vnd.docker.raw-stream",
+                                       "Api-Version: 1.41",
+                                       "Docker-Experimental: false",
+                                       "Ostype: linux",
+                                       "Server: Docker/20.10.2 (linux)",
+                                      };
+                                      for (const std::string& s : header) {
+                                        c.BlockingWrite(s + "\r\n", true);
+                                      }
+
+                                      // These two lines are missing from the response from a Docker daemon.
+                                      if (r.url.query.has("ok")) {
+                                        c.BlockingWrite("Connection: upgrade\r\n", true);
+                                        c.BlockingWrite("Upgrade: DoCkErSuCkS =)\r\n", true);
+                                      }
+
+                                      c.BlockingWrite("\r\n", true);
+                                      std::vector<std::string> chunks = {
+                                        "fo",
+                                        "o\n",
+                                        "bar\n",
+                                        "baz\n"
+                                      };
+
+                                      const bool wait_after_foo = r.url.query.has("wait_after_foo");
+                                      for (const std::string& s : chunks) {
+                                        c.BlockingWrite(s, true);
+                                        if (s == "foo" && wait_after_foo) {
+                                          wait_after_foo_signal.Wait([](bool b) { return b; });
+                                        }
+                                      }
+                                      c.BlockingWrite("", false);
+                                   });
+
+  const std::string base = Printf("http://localhost:%d", FLAGS_net_api_test_port);
+  EXPECT_EQ("foo", HTTP(GET(base + "/correct")).body);
+  EXPECT_EQ("", HTTP(GET(base + "/potentially_malformed")).body);
+  EXPECT_EQ("foo\nbar\nbaz\n", HTTP(GET(base + "/potentially_malformed?ok")).body);
+
+  std::vector<std::string> lines_malformed;
+  std::string header_malformed;
+  const auto response_malformed = HTTP(ChunkedGET(base + "/potentially_malformed")
+      .OnHeader([&header_malformed](const std::string& k, const std::string& v) {
+        if (k == "Content-Type") {
+          header_malformed = v;
+        }
+      })
+      .OnLine([&lines_malformed](const std::string& s) { lines_malformed.push_back(s); }));
+  EXPECT_EQ(200, static_cast<int>(response_malformed));
+  EXPECT_EQ("[]", JSON(lines_malformed));
+  EXPECT_EQ("application/vnd.docker.raw-stream", header_malformed);
+
+  std::vector<std::string> lines_fixed;
+  const auto response_fixed = HTTP(ChunkedGET(base + "/potentially_malformed")
+      .OnHeader([](const std::string& k, const std::string& v, current::net::HTTPResponseKind& response_kind) {
+        if (k == "Content-Type" && v == "application/vnd.docker.raw-stream") {
+          response_kind.MarkAsUpgraded();
+        }
+      })
+      .OnLine([&lines_fixed](const std::string& s) {
+        lines_fixed.push_back(s);
+      }));
+  EXPECT_EQ(200, static_cast<int>(response_fixed));
+  EXPECT_EQ("[\"foo\",\"bar\",\"baz\"]", JSON(lines_fixed));
+
+  std::vector<std::string> lines_with_wait;
+  const auto response_with_wait = HTTP(ChunkedGET(base + "/potentially_malformed?wait_after_foo")
+      .OnHeader([](const std::string& k, const std::string& v, current::net::HTTPResponseKind& response_kind) {
+        if (k == "Content-Type" && v == "application/vnd.docker.raw-stream") {
+          response_kind.MarkAsUpgraded();
+        }
+      })
+      .OnLine([&lines_with_wait, &wait_after_foo_signal](const std::string& s) {
+        if (s == "foo") {
+          *wait_after_foo_signal.MutableScopedAccessor() = true;
+        }
+        lines_with_wait.push_back(s);
+      }));
+  EXPECT_EQ(200, static_cast<int>(response_with_wait));
+  EXPECT_EQ("[\"foo\",\"bar\",\"baz\"]", JSON(lines_with_wait));
 }
 
 TEST(HTTPAPI, PostFromBufferToBuffer) {
